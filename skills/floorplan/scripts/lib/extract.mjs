@@ -501,6 +501,18 @@ function railsRoutes(code, at) {
   return routes;
 }
 
+/** An ERB template with everything outside its tags blanked, so only the Ruby is read. */
+function erbRuby(src) {
+  const out = blank(src).split('');
+  for (const m of all(/<%(?!#)[-=]{0,2}([\s\S]*?)-?%>/g, src)) {
+    const inner = m[1];
+    if (!inner) continue;
+    const at = m.index + m[0].indexOf(inner, 2);
+    for (let i = 0; i < inner.length; i++) out[at + i] = inner[i];
+  }
+  return out.join('');
+}
+
 function extractRuby(src, filePath) {
   const code = stripHash(src);
   const at = lineIndex(code);
@@ -553,6 +565,7 @@ function extractByLang(src, lang, filePath) {
     case 'rust': return extractRust(src);
     case 'java': case 'kotlin': case 'scala': case 'groovy': return extractJvm(src);
     case 'ruby': return extractRuby(src, filePath);
+    case 'erb': return extractRuby(erbRuby(src), filePath);
     default: return extractSimple(src, lang);
   }
 }

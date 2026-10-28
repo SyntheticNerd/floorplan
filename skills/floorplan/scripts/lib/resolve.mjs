@@ -280,7 +280,7 @@ export function createResolver(root, files) {
       case 'go': return resolveGo(file.path, imp.spec);
       case 'rust': return resolveRust(file.path, imp);
       case 'java': case 'kotlin': case 'scala': case 'groovy': return resolveJvm(file.path, imp.spec);
-      case 'ruby': return imp.kind === 'const'
+      case 'ruby': case 'erb': return imp.kind === 'const'
         ? resolveRubyConst(file.path, imp.spec, file.repo || '.')
         : resolveRelative(file.path, imp.spec, ['.rb']);
       case 'php': return resolveRelative(file.path, imp.spec, ['.php']);

@@ -238,6 +238,28 @@ test('Ruby: require_relative still resolves', () => {
   assert.deepEqual(r.imports.map((i) => i.spec), ['./support/thing']);
 });
 
+// ---------- ERB views ----------
+
+test('ERB: only what is inside the tags is Ruby', () => {
+  const r = extract([
+    `<h1>Export Batches</h1>`,
+    `<%= render ExportBatchPresenter.new(batch) %>`,
+    `<% if Current.user %>`,
+    `  <%= t('.title') %>`,
+    `<% end %>`,
+  ].join('\n'), 'erb', 'app/views/export_batches/index.html.erb');
+  const specs = r.imports.map((i) => i.spec);
+  assert.ok(specs.includes('ExportBatchPresenter'), `expected the presenter, got ${specs.join(', ')}`);
+  assert.ok(specs.includes('Current'), 'Current is referenced in a tag');
+  assert.ok(!specs.includes('Export'), 'words in the markup are not constants');
+  assert.ok(!specs.includes('Batches'), 'nor are these');
+});
+
+test('ERB: a view counts as code, so the UI is on the map', async () => {
+  const { classify } = await lib('common.mjs');
+  assert.equal(classify('app/views/home/index.html.erb', 100).category, 'code');
+});
+
 // ---------- end to end ----------
 
 test('a Rails app gets edges between its files and endpoints on its controllers', () => {
