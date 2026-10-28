@@ -226,6 +226,41 @@ export function createResolver(root, files) {
     return { external: parts.slice(0, Math.min(3, parts.length - 1)).join('.'), eco: 'maven' };
   };
 
+  // ---- Ruby: Zeitwerk ----
+  // Rails derives a constant from the file's path under an autoload root, so the paths are the index.
+  // app/<anything>/ and lib/ are roots; app/assets, app/javascript and app/views hold no constants,
+  // and a concerns/ folder is transparent.
+  const RUBY_NOT_ROOTS = new Set(['assets', 'javascript', 'views']);
+  const camelize = (s) => s.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+  const autoloadPath = (p) => {
+    const app = /(?:^|\/)app\/([^/]+)\/(.+)$/.exec(p);
+    if (app) return RUBY_NOT_ROOTS.has(app[1]) ? null : app[2].replace(/^concerns\//, '');
+    const lib = /(?:^|\/)lib\/(.+)$/.exec(p);
+    return lib ? lib[1] : null;
+  };
+  const rubyConsts = new Map(); // `repo|Const::Path` -> file
+  const rubyOwn = new Map();    // file -> Const::Path
+  for (const f of files) {
+    if (f.lang !== 'ruby') continue;
+    const rel = autoloadPath(f.path);
+    if (!rel || !rel.endsWith('.rb')) continue;
+    const konst = rel.slice(0, -3).split('/').map(camelize).join('::');
+    rubyOwn.set(f.path, konst);
+    const key = `${f.repo || '.'}|${konst}`;
+    if (!rubyConsts.has(key)) rubyConsts.set(key, f.path);
+  }
+  const resolveRubyConst = (from, spec, repo) => {
+    // Ruby looks a bare constant up through the enclosing namespaces first, innermost out.
+    const parts = (rubyOwn.get(from) || '').split('::').filter(Boolean);
+    for (let k = parts.length - 1; k >= 1; k--) {
+      const hit = rubyConsts.get(`${repo}|${parts.slice(0, k).join('::')}::${spec}`);
+      if (hit && hit !== from) return { file: hit };
+    }
+    const hit = rubyConsts.get(`${repo}|${spec}`);
+    if (hit && hit !== from) return { file: hit };
+    return { builtin: true }; // a gem, the standard library, or Rails itself
+  };
+
   // ---- generic relative (C, Ruby, PHP, CSS) ----
   const byBasename = new Map();
   for (const f of files) { const b = P.basename(f.path); byBasename.set(b, byBasename.has(b) ? null : f.path); }
@@ -245,7 +280,9 @@ export function createResolver(root, files) {
       case 'go': return resolveGo(file.path, imp.spec);
       case 'rust': return resolveRust(file.path, imp);
       case 'java': case 'kotlin': case 'scala': case 'groovy': return resolveJvm(file.path, imp.spec);
-      case 'ruby': return resolveRelative(file.path, imp.spec, ['.rb']);
+      case 'ruby': return imp.kind === 'const'
+        ? resolveRubyConst(file.path, imp.spec, file.repo || '.')
+        : resolveRelative(file.path, imp.spec, ['.rb']);
       case 'php': return resolveRelative(file.path, imp.spec, ['.php']);
       case 'css': return resolveRelative(file.path, imp.spec, ['.css', '.scss', '.sass', '.less']).file ? resolveRelative(file.path, imp.spec, ['.css', '.scss']) : resolveRelative(file.path, P.join(P.dirname(imp.spec), '_' + P.basename(imp.spec)), ['.scss', '.sass']);
       default: return resolveRelative(file.path, imp.spec, []);

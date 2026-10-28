@@ -65,6 +65,14 @@ export function resolveRoutes(files) {
     return each.reduce((a, b) => a.filter((x) => b.includes(x)));
   };
 
+  // Rails keeps every endpoint in one routes.rb and names the controller that serves it.
+  // The endpoint belongs on that controller, not on the routing table.
+  const controllerFiles = new Map();
+  for (const f of files) {
+    const m = /(?:^|\/)app\/controllers\/(.+)_controller\.rb$/.exec(f.path);
+    if (m) controllerFiles.set(m[1], f.path);
+  }
+
   const routes = [];
   for (const f of files) {
     // Test files define throwaway apps and stub servers; their routes aren't part of the system.
@@ -72,7 +80,8 @@ export function resolveRoutes(files) {
     for (const r of f.routes) {
       const defPrefix = (r.var && f.routers?.[r.var]) || '';
       const mw = mountMw(f.path, r.var);
-      for (const mp of outerPrefixes(f.path, r.var)) routes.push({ file: f.path, method: r.method, path: joinPath(mp, defPrefix, r.path), line: r.line, ...(r.handler ? { handler: r.handler } : {}), ...(r.doc ? { doc: r.doc } : {}), ...(mw.length ? { mountMw: mw } : {}) });
+      const owner = (r.controller && controllerFiles.get(r.controller)) || f.path;
+      for (const mp of outerPrefixes(f.path, r.var)) routes.push({ file: owner, method: r.method, path: joinPath(mp, defPrefix, r.path), line: r.line, ...(r.handler ? { handler: r.handler } : {}), ...(r.doc ? { doc: r.doc } : {}), ...(mw.length ? { mountMw: mw } : {}) });
     }
   }
   return dedupe(routes, (r) => `${r.file}|${r.method}|${r.path}`);

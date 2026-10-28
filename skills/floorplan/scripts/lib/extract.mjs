@@ -357,6 +357,177 @@ function extractJvm(src) {
   return { imports, symbols, routes, mounts: [], calls, hosts, pkg };
 }
 
+// ---------- Ruby / Rails ----------
+
+// Rails autoloads, so a file names its collaborators by constant rather than by require.
+// Anything that is not a file in this codebase falls out as `builtin` when it is resolved.
+const RUBY_LITERAL = /(["'])(?:\\.|(?!\1)[^\\\n])*\1|%[wiWI][[({][^\])}]*[\])}]|\/(?:\\.|[^\/\n])+\//g;
+const RUBY_CONST = /(?<![.:@$\w])([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)/g;
+const RUBY_DECL = /^\s*(?:class|module)\s+([A-Z][\w:]*)/gm;
+
+const singularize = (w) => /ies$/.test(w) ? w.replace(/ies$/, 'y')
+  : /(ss|sh|ch|x|z)es$/.test(w) ? w.replace(/es$/, '')
+  : /s$/.test(w) && !/ss$/.test(w) ? w.replace(/s$/, '') : w;
+
+const segsOf = (s) => (s || '').split('/').filter(Boolean);
+const unquote = (v) => v == null ? null : v.replace(/^[:'"]|['"]$/g, '');
+
+/** The value of a Ruby keyword argument, as written. */
+function opt(args, key) {
+  const re = new RegExp(`\\b${key}:\\s*(%[iwIW][[({][^\\])}]*[\\])}]|\\[[^\\]]*\\]|:\\w+|'[^']*'|"[^"]*"|true|false)`);
+  return re.exec(args)?.[1] || null;
+}
+
+/** `%i[index show]`, `[:index, :show]` or `:index` as a list of names. */
+function symList(v) {
+  if (!v) return null;
+  const pct = /^%[iwIW][[({]([^\])}]*)[\])}]/.exec(v);
+  if (pct) return pct[1].trim().split(/\s+/).filter(Boolean);
+  if (v.startsWith('[')) return [...v.matchAll(/:?(\w+)/g)].map((x) => x[1]);
+  const sym = /^:(\w+)/.exec(v);
+  return sym ? [sym[1]] : null;
+}
+
+// `rails routes` order, so a generated map lists endpoints the way the framework does. The flag
+// marks the actions that address one record: under `shallow: true` those move out of the parent's
+// path while index, create and new stay nested under it.
+const PLURAL_ACTIONS = [['index', 'GET', '', false], ['create', 'POST', '', false], ['new', 'GET', 'new', false],
+  ['edit', 'GET', 'edit', true], ['show', 'GET', '', true], ['update', 'PATCH', '', true],
+  ['update', 'PUT', '', true], ['destroy', 'DELETE', '', true]];
+const SINGULAR_ACTIONS = [['create', 'POST', ''], ['new', 'GET', 'new'], ['edit', 'GET', 'edit'],
+  ['show', 'GET', ''], ['update', 'PATCH', ''], ['update', 'PUT', ''], ['destroy', 'DELETE', '']];
+
+const BLOCK_OPEN = /(^|\s)do(\s*\|[^|]*\|)?$|^\s*(if|unless|case|begin|while|until|def)\b/;
+
+/** Logical lines: a Ruby call whose arguments wrap onto the next line is one statement. */
+function logicalLines(code) {
+  const out = [];
+  const raw = code.split('\n');
+  for (let i = 0; i < raw.length; i++) {
+    let text = raw[i], line = i;
+    while (/[,(]\s*$/.test(text) && i + 1 < raw.length) text += ' ' + raw[++i].trim();
+    out.push({ text: text.trim(), line: line + 1 });
+  }
+  return out;
+}
+
+/**
+ * Endpoints declared in config/routes.rb. Rails keeps them all in one file and names a
+ * controller, so each one is attributed to that controller when the routes are resolved.
+ *
+ * Every open block carries the path its children hang off, which is what makes nesting,
+ * `member`/`collection` and shallow routes fall out without looking back up the stack.
+ */
+function railsRoutes(code, at) {
+  const routes = [];
+  const stack = [];
+  const add = (method, segs, controller, action, line) =>
+    routes.push({ method, path: '/' + segs.filter(Boolean).join('/'), var: null, line, framework: 'rails', controller: controller ?? null, action, handler: action });
+
+  const top = () => stack[stack.length - 1];
+  const childBase = () => top()?.childBase ?? [];
+  const mods = () => stack.flatMap((f) => f.mod || []);
+  const isResource = (f) => f.t === 'resources' || f.t === 'resource';
+  const enclosing = () => [...stack].reverse().find(isResource);
+  /** Where a shallow child hangs: the innermost block that is not itself a resource. */
+  const outsideResources = () => {
+    for (let i = stack.length - 1; i >= 0; i--) if (!isResource(stack[i])) return stack[i].childBase;
+    return [];
+  };
+
+  for (const { text, line } of logicalLines(code)) {
+    const opens = BLOCK_OPEN.test(text);
+    let frame = null;
+
+    const res = /^(resources?)\s+:(\w+)(.*)$/.exec(text);
+    const ns = /^namespace\s+:(\w+)(.*)$/.exec(text);
+    const scope = /^scope\s+(.*)$/.exec(text);
+    const verb = /^(get|post|put|patch|delete|match)\s+(.+)$/.exec(text);
+    const root = /^root\s+(.*)$/.exec(text);
+
+    if (res) {
+      const plural = res[1] === 'resources', name = res[2], args = res[3];
+      const ctrl = [...mods(), unquote(opt(args, 'controller')) || name].join('/');
+      const path = segsOf(unquote(opt(args, 'path')) ?? name);
+      const only = symList(opt(args, 'only')), except = symList(opt(args, 'except'));
+      const base = [...childBase(), ...path];
+      const shallow = /\bshallow:\s*true/.test(args) && !!enclosing();
+      const memberBase = shallow ? [...outsideResources(), ...path] : base;
+      const allowed = (action) => (!only || only.includes(action)) && !(except && except.includes(action));
+
+      if (plural) {
+        for (const [action, method, suffix, member] of PLURAL_ACTIONS) {
+          if (!allowed(action)) continue;
+          add(method, member ? [...memberBase, ':id', suffix] : [...base, suffix], ctrl, action, line);
+        }
+      } else {
+        for (const [action, method, suffix] of SINGULAR_ACTIONS) if (allowed(action)) add(method, [...base, suffix], ctrl, action, line);
+      }
+      const nestId = `:${singularize(name)}_id`;
+      frame = { t: plural ? 'resources' : 'resource', controller: ctrl, base, memberBase, singular: !plural,
+        childBase: plural ? [...base, nestId] : base };
+    } else if (ns) {
+      const path = segsOf(unquote(opt(ns[2], 'path')) ?? ns[1]);
+      frame = { t: 'namespace', mod: [ns[1]], childBase: [...childBase(), ...path] };
+    } else if (scope) {
+      const bare = /^:(\w+)/.exec(scope[1]);
+      const path = segsOf(unquote(opt(scope[1], 'path')) ?? (bare ? bare[1] : null));
+      frame = { t: 'scope', mod: segsOf(unquote(opt(scope[1], 'module'))), childBase: [...childBase(), ...path] };
+    } else if (/^member\b/.test(text)) {
+      const p = enclosing();
+      frame = { t: 'member', childBase: p ? (p.singular ? p.memberBase : [...p.memberBase, ':id']) : childBase() };
+    } else if (/^collection\b/.test(text)) {
+      frame = { t: 'collection', childBase: enclosing()?.base ?? childBase() };
+    } else if (root) {
+      const t = /['"]([\w/]+)#(\w+)['"]/.exec(root[1]);
+      if (t) add('GET', childBase(), [...mods(), t[1]].join('/'), t[2], line);
+    } else if (verb) {
+      const rest = verb[2];
+      const sym = /^:(\w+)/.exec(rest), str = /^['"]([^'"]*)['"]/.exec(rest);
+      if (sym || str) {
+        // A redirect or a Rack app is still an endpoint; it just has no controller behind it.
+        const target = /=>\s*['"]([\w/]+)#(\w+)['"]/.exec(rest) || /\bto:\s*['"]([\w/]+)#(\w+)['"]/.exec(rest);
+        let action = sym ? sym[1] : null, controller;
+        if (target) { controller = [...mods(), target[1]].join('/'); action = target[2]; }
+        else controller = enclosing()?.controller ?? null;
+        action = unquote(opt(rest, 'action')) ?? action;
+        add(verb[1] === 'match' ? 'ANY' : verb[1].toUpperCase(), [...childBase(), ...segsOf(sym ? sym[1] : str[1])], controller, action, line);
+      }
+    }
+
+    if (opens) stack.push(frame ?? { t: 'other', childBase: childBase() });
+    else if (/^end\b/.test(text)) stack.pop();
+  }
+  return routes;
+}
+
+function extractRuby(src, filePath) {
+  const code = stripHash(src);
+  const at = lineIndex(code);
+  const imports = [];
+  for (const m of all(/\brequire_relative\s*\(?\s*["']([^"']+)["']/g, code)) {
+    imports.push({ spec: './' + m[1].replace(/^\.\//, ''), names: [], line: at(m.index) });
+  }
+
+  const symbols = [];
+  for (const m of all(/^\s*(class|module)\s+([A-Z][\w:]*)/gm, code)) symbols.push({ name: m[2], kind: m[1], line: at(m.index) });
+
+  // Its own declarations are not references to somewhere else.
+  const declared = new Set();
+  for (const m of all(RUBY_DECL, code)) for (const part of m[1].split('::')) declared.add(part);
+  const seen = new Set();
+  for (const m of all(RUBY_CONST, code.replace(RUBY_LITERAL, blank))) {
+    const spec = m[1];
+    if (seen.has(spec) || /^[A-Z0-9_]+$/.test(spec) || declared.has(spec)) continue;
+    seen.add(spec);
+    imports.push({ spec, names: [], kind: 'const', line: at(m.index) });
+  }
+
+  const routes = /(^|\/)config\/routes\.rb$/.test(filePath || '') ? railsRoutes(code, at) : [];
+  const { calls, hosts } = extractCalls(code, at);
+  return { imports, symbols, routes, mounts: [], calls, hosts };
+}
+
 // ---------- small ones ----------
 
 function extractSimple(src, lang) {
@@ -381,6 +552,7 @@ function extractByLang(src, lang, filePath) {
     case 'go': return extractGo(src);
     case 'rust': return extractRust(src);
     case 'java': case 'kotlin': case 'scala': case 'groovy': return extractJvm(src);
+    case 'ruby': return extractRuby(src, filePath);
     default: return extractSimple(src, lang);
   }
 }

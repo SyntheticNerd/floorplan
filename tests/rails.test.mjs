@@ -146,6 +146,29 @@ test('Rails: nested resources sit under the parent id', () => {
   ]);
 });
 
+test('Rails: shallow nesting lifts the member endpoints out of the parent', () => {
+  assert.deepEqual(sigs(draw([
+    `  resources :agris_instances, only: :show do`,
+    `    resources :agris_tenants, shallow: true, only: %i[index show] do`,
+    `      member do`,
+    `        put :verify`,
+    `      end`,
+    `    end`,
+    `  end`,
+  ].join('\n'))), [
+    'GET /agris_instances/:id',
+    'GET /agris_instances/:agris_instance_id/agris_tenants',
+    'GET /agris_tenants/:id',
+    'PUT /agris_tenants/:id/verify',
+  ]);
+});
+
+test('Rails: a redirect is an endpoint too, just not one a controller serves', () => {
+  const r = routesOf(draw(`  get '/ar', to: redirect('/ar/exports')`));
+  assert.deepEqual(r.map((x) => `${x.method} ${x.path}`), ['GET /ar']);
+  assert.equal(r[0].controller, null);
+});
+
 test('Rails: routes.rb is the only Ruby file read for endpoints', () => {
   assert.deepEqual(extract(`get 'x' => 'y#z'\n`, 'ruby', 'app/models/thing.rb').routes, []);
 });
@@ -170,11 +193,13 @@ test('Zeitwerk: a bare constant prefers the referencing file own namespace', () 
     { path: 'app/services/agris/export_disbursement.rb', lang: 'ruby', repo: '.' },
     { path: 'app/services/agris/client.rb', lang: 'ruby', repo: '.' },
     { path: 'app/models/client.rb', lang: 'ruby', repo: '.' },
+    { path: 'app/models/invoice.rb', lang: 'ruby', repo: '.' },
   ];
   const root = makeProject(Object.fromEntries(files.map((f) => [f.path, ''])));
   const resolve = createResolver(root, files);
+  // Inside module Agris, `Client` is Agris::Client; from the top level it is the plain one.
   assert.equal(resolve(files[0], { spec: 'Client', kind: 'const' }).file, 'app/services/agris/client.rb');
-  assert.equal(resolve(files[2], { spec: 'Client', kind: 'const' }).file, 'app/models/client.rb');
+  assert.equal(resolve(files[3], { spec: 'Client', kind: 'const' }).file, 'app/models/client.rb');
 });
 
 test('Zeitwerk: a constant that is not ours is not an external package', () => {
@@ -246,10 +271,13 @@ test('a Rails app gets edges between its files and endpoints on its controllers'
   assert.equal(index.file, 'app/controllers/companies_controller.rb',
     'an endpoint belongs to its controller, not to routes.rb');
 
-  const edges = scan.files
-    .find((f) => f.path === 'app/controllers/companies_controller.rb')
-    .imports.flatMap((i) => i.files || []);
+  const edges = scan.edges
+    .filter((e) => e.from === 'app/controllers/companies_controller.rb')
+    .map((e) => e.to);
   assert.ok(edges.includes('app/models/company.rb'), `expected a Company edge, got ${edges.join(', ')}`);
   assert.ok(edges.includes('app/models/export_batch.rb'), 'ExportBatch is an edge too');
+
+  // ApplicationController and ApplicationRecord are Rails, not packages this app depends on.
+  assert.deepEqual(scan.externals, []);
   assert.match(out, /ruby/);
 });
